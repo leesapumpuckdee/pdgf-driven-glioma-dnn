@@ -1,0 +1,305 @@
+import numpy as np #for arrays, normalization, splitting data
+import pandas as pd #mainly for reading csv files
+import torch #used for building the nn
+import torch.nn as nn #used for buildling the nn layers like linear, conv, etc
+import torch.nn.functional as F #used for actviation functions like reLu, sigmoid, etc,
+import torch.optim as optim #gives optimization algorithms such as SGD.
+from pathlib import Path #used for creating directories and file paths
+
+#this code is inspired by the shallow MNIST neural network example,
+#but modified for the PDGF tumor model!!
+
+#folder where all output files from this run will be saved
+#this Python file is stored inside src/
+#parent.parent takes us back to the main GitHub project folder
+
+project_dir = Path(__file__).resolve().parent.parent
+
+data_dir = project_dir / "data"
+logs_dir = project_dir / "logs"
+results_dir = project_dir / "results"
+
+#make sure the folders exist
+data_dir.mkdir(parents=True, exist_ok=True)
+logs_dir.mkdir(parents=True, exist_ok=True)
+results_dir.mkdir(parents=True, exist_ok=True)
+
+print("Project folder:", project_dir)
+print("Data folder:", data_dir)
+print("Logs folder:", logs_dir)
+print("Results folder:", results_dir)
+
+print(f"All output files will be saved in: {results_dir.resolve()}")
+
+#loading dataset
+#the header uses commas, but the data rows use tabs
+#so we skip the original header and provide the correct column names ourselves
+data = pd.read_csv(
+    data_dir / "regression-09-04-2026.csv",
+    sep="\t",
+    skiprows=1,
+    names=[
+        "alpha_a",
+        "gamma_a",
+        "mu",
+        "Gperc",
+        "Nperc",
+        "Tterm"
+    ]
+)
+
+#making sure every column contains numerical values
+data = data.apply(pd.to_numeric, errors="raise")
+
+print("Columns:", data.columns.tolist())
+print(data.head())
+
+#first 3 columns are input parameters: alpha_a, gamma_a, and mu
+x = data.iloc[:, 0:3].to_numpy(dtype=np.float32)
+
+#last 3 columns are outputs: Gperc, Nperc, and Tterm
+y = data.iloc[:, 3:6].to_numpy(dtype=np.float32)
+
+print("Input shape:", x.shape)
+print("Output shape:", y.shape)
+
+#splitting data into training, validation, + testing sets 70/15/15
+#training set is used to update the weights of the model
+#validation set is used to check the model and help choose hyperparameters
+#testing set is used to evaluate the model after training is complete
+num_data = x.shape[0] #total num of datapoints whihc is 125 for right now
+indices = np.arange(num_data) #creates row indices for data
+
+np.random.seed(1) #makes the random split reproducible so we can get same split every time we run the code
+torch.manual_seed(1) #makes the model's random starting weights reproducible
+np.random.shuffle(indices) #shuffles the indices so we can randomly split the data
+
+train_end = int(0.7 * num_data)
+val_end = int(0.85 * num_data)
+
+train_indices = indices[:train_end]
+val_indices = indices[train_end:val_end]
+test_indices = indices[val_end:]
+
+#splitting the original data before normalization
+x_train_raw = x[train_indices]
+y_train_raw = y[train_indices]
+
+x_val_raw = x[val_indices]
+y_val_raw = y[val_indices]
+
+x_test_raw = x[test_indices]
+y_test_raw = y[test_indices]
+
+#saving the data split so the plotting file uses the exact same test data
+np.save(results_dir / "train_indices.npy", train_indices)
+np.save(results_dir / "val_indices.npy", val_indices)
+np.save(results_dir / "test_indices.npy", test_indices)
+
+print("Data split indices saved to", results_dir.resolve())
+
+
+#normalizing data b/c columns have diff ranges
+#normalization means to subtract the mean & divide by the STD
+#only the training data is used to find the mean and STD
+#this keeps the validation and testing data unseen during training
+x_mean = np.mean(x_train_raw, axis=0)
+x_std = np.std(x_train_raw, axis=0)
+
+#only normalizing Tterm
+#using mean=0 and std=1 leaves Gperc and Nperc unchanged
+y_mean = np.array([
+    0.0,
+    0.0,
+    np.mean(y_train_raw[:, 2])
+], dtype=np.float32)
+
+y_std = np.array([
+    1.0,
+    1.0,
+    np.std(y_train_raw[:, 2])
+], dtype=np.float32)
+
+#prevents division by zero if a column has no variation
+x_std[x_std == 0] = 1.0
+
+if y_std[2] == 0:
+    y_std[2] = 1.0
+
+#normalizing the training, validation, and testing data
+#using the mean and STD from the training data
+x_train = (x_train_raw - x_mean) / x_std
+x_val = (x_val_raw - x_mean) / x_std
+x_test = (x_test_raw - x_mean) / x_std
+
+y_train = (y_train_raw - y_mean) / y_std
+y_val = (y_val_raw - y_mean) / y_std
+y_test = (y_test_raw - y_mean) / y_std
+
+#converting numpy arrays into pytorch tensors
+x_train = torch.tensor(x_train, dtype=torch.float32)
+y_train = torch.tensor(y_train, dtype=torch.float32)
+
+x_val = torch.tensor(x_val, dtype=torch.float32)
+y_val = torch.tensor(y_val, dtype=torch.float32)
+
+x_test = torch.tensor(x_test, dtype=torch.float32)
+y_test = torch.tensor(y_test, dtype=torch.float32)
+
+print("Number of training data:", x_train.shape[0])
+print("Number of validation data:", x_val.shape[0])
+print("Number of test data:", x_test.shape[0])
+
+#shallow nn has 1 hidden layer, a dnn has multiple,
+#to make it deep we add 1 more hidden layer between them!!!
+#similar to shallow MNIST nn but changed for regression instead of classification
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.fc1 = nn.Linear(3, 32) #input layer to first hidden layer
+        self.fc2 = nn.Linear(32, 32) #first hidden layer to second hidden layer makes it deep!
+        self.fc3 = nn.Linear(32, 3) #second hidden layer to output layer
+        #the shallow MNIST nn had 1 hidden layer, this has 2 so its a small dnn
+        #3 inputs - 32 neursons - 32 neurons - 3 outputs
+
+    def forward(self, x):
+
+    #hidden layers stay exactly the same
+    x = F.relu(self.fc1(x))
+    x = F.relu(self.fc2(x))
+
+    #raw output from final linear layer
+    raw_output = self.fc3(x)
+
+    #Gperc must stay between 0 and 1
+    Gperc = torch.sigmoid(
+        raw_output[:, 0:1]
+    )
+
+    #Nperc must stay between 0 and 1
+    Nperc = torch.sigmoid(
+        raw_output[:, 1:2]
+    )
+
+    #Tterm stays linear because it is not a percentage
+    Tterm = raw_output[:, 2:3]
+
+    #put the 3 outputs back together
+    output = torch.cat(
+        (
+            Gperc,
+            Nperc,
+            Tterm
+        ),
+        dim=1
+    )
+
+    return output
+       
+model = Net()
+print(model)
+
+#loss function + optimizer, bc outputs r real-valued we used MSE (aka mean square error)
+criterion = nn.MSELoss()
+optimizer = optim.SGD(model.parameters(), lr=0.01) 
+#using the cross_validation set (validation set) to monitor the model's performance during training,
+#i was able to find that an lr=0.01 provided the lowest validation loss
+#the SGD optimizer updates the model parameters in the direction that lowers the loss (ch. 7)
+#the entire training set is currently used for each update because the dataset is small
+#model.parameters gives SGD the weights and biases
+#lr is the learning rate controlling the step size of each update
+
+#lists for saving loss history
+epoch_history = []
+training_loss_history = []
+validation_loss_history = []
+
+#training loop
+num_epochs = 6500 #number of times we go through the entire training dataset
+for epoch in range(num_epochs):
+    model.train() 
+    train_outputs = model(x_train) #forward pass; inputs go through nn
+    loss = criterion(train_outputs, y_train) #compute loss; how far prediction is from true training outputs
+    optimizer.zero_grad() #zero the gradients
+    loss.backward() #backpropagation ch. 6!! computes gradients of the loss w.r.t model weights
+    optimizer.step() #update weights mentioned in ch. 7 b/c it performs SGD update step; reduces loss
+
+    if epoch % 300 == 0:
+        model.eval()
+
+        with torch.no_grad():
+            val_outputs = model(x_val)
+            val_loss = criterion(val_outputs, y_val)
+
+            epoch_history.append(epoch)
+            training_loss_history.append(loss.item())
+            validation_loss_history.append(val_loss.item())
+
+            print(f"Epoch [{epoch}/{num_epochs}], Training Loss: {loss.item():.4f}, Validation Loss: {val_loss.item():.4f}")
+
+#save loss history
+
+loss_history = pd.DataFrame({
+    "Epoch": epoch_history,
+    "Training_Loss": training_loss_history,
+    "Validation_Loss": validation_loss_history
+})
+
+loss_history.to_csv(
+    logs_dir / "sigmoid_loss_history.csv",
+    index=False
+)
+
+print(
+    "Loss history saved to logs/loss_history.csv"
+)
+#yayyy testing
+model.eval()
+with torch.no_grad():
+    test_output = model(x_test)
+    test_loss = criterion(test_output, y_test)
+    print(f"Test Loss: {test_loss.item():.4f}")
+
+#converting predictions back to og scale for interpretation of predictions
+test_predictions = test_output.numpy() * y_std + y_mean
+test_actuals = y_test.numpy() * y_std + y_mean
+
+print("Test Predictions (Gperc, Nperc, Tterm):")
+for i in range(len(test_predictions)):
+    print(f"Predicted: {test_predictions[i]}, Actual: {test_actuals[i]}")
+
+results = pd.DataFrame({
+    "Actual_Gperc": test_actuals[:, 0],
+    "Predicted_Gperc": test_predictions[:, 0],
+
+    "Actual_Nperc": test_actuals[:, 1],
+    "Predicted_Nperc": test_predictions[:, 1],
+
+    "Actual_Tterm": test_actuals[:, 2],
+    "Predicted_Tterm": test_predictions[:, 2]
+})
+
+#save test predictions
+results.to_csv(
+    logs_dir / "sigmoid_test_predictions.csv",
+    index=False
+)
+
+print("Test predictions saved to logs/test_predictions.csv")
+
+#save model
+torch.save(
+    model.state_dict(),
+    results_dir / "tumor_dnn_model_sigmoid.pth"
+)
+
+np.save(results_dir / "x_mean.npy", x_mean)
+np.save(results_dir / "x_std.npy", x_std)
+np.save(results_dir / "y_mean.npy", y_mean)
+np.save(results_dir / "y_std.npy", y_std)
+
+#important b/c any new input MUST be normalized using same mean + STD
+print("Model and normalization parameters saved to", results_dir.resolve())
+
+#future notes from zeng! (ch. 9 related)
+#if model overfit, we can try adding droppout layers, regularization, or early stopping but for now this model will remain a simple dnn
